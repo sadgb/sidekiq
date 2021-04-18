@@ -15,10 +15,13 @@ module Sidekiq
         Sidekiq.redis do |conn|
           sorted_sets.each do |sorted_set|
             # Get next items in the queue with scores (time to execute) <= now.
-            until (jobs = conn.zrangebyscore(sorted_set, "-inf", now, limit: [0, 100])).empty?
+            counter = 0
+            offset = 0
+            until (jobs = conn.zrangebyscore(sorted_set, "-inf", now, limit: [offset, 100])).empty?
               # We need to go through the list one at a time to reduce the risk of something
               # going wrong between the time jobs are popped from the scheduled queue and when
               # they are pushed onto a work queue and losing the jobs.
+              counter = 0
               jobs.each do |job|
                 # Pop item off the queue and add it to the work queue. If the job can't be popped from
                 # the queue, it's because another process already popped it so we can move on to the
@@ -26,7 +29,16 @@ module Sidekiq
                 if conn.zrem(sorted_set, job)
                   Sidekiq::Client.push(Sidekiq.load_json(job))
                   Sidekiq.logger.debug { "enqueued #{sorted_set}: #{job}" }
+                else
+                  counter += 1
                 end
+              end
+
+              if counter > 50
+                #
+                # у нас тут больше 50 zrem пролетело - высокий конкаренси надо прыгать и фетчить с другого места
+                # иначе помрем
+                offset = (200..10000).to_a.sample
               end
             end
           end
