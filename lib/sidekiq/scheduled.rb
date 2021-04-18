@@ -34,13 +34,52 @@ module Sidekiq
                 end
               end
 
-              if counter > 50
+              if counter > 70
                 #
                 # у нас тут больше 50 zrem пролетело - высокий конкаренси надо прыгать и фетчить с другого места
                 # иначе помрем
-                offset = (200..10000).to_a.sample
+
+                # говорят zcount очень эффективна
+                # более того мы выполним ее всего 1 раз и дальше уже с новым офсетом конфликтов быть не должно
+                # пока не высосем ВСЮ очередь
+                queue_length = conn.zcount(sorted_set, "-inf", now)
+
+                if queue_length < 1000
+                  # и так должно отработать хорошо
+                  offset = 0
+                else
+                  # нет смысла уходить дальше чем 10_000 какая бы жирная очередь не была
+                  # это число выбранно эмпирически
+                  # но чем больше у вас сайдкиков тем больше число
+                  max_offset = [queue_length / 2, 10_000].min
+                end
+
+                offset = (0..max_offset).to_a.sample
               end
             end
+          end
+        end
+      end
+    end
+
+    def x
+      Sidekiq.redis do |conn|
+        sorted_set = 'schedule'
+        # Get next items in the queue with scores (time to execute) <= now.
+        counter = 0
+        offset = 0
+        until (jobs = conn.zrangebyscore(sorted_set, "-inf", Time.now.to_f.to_s, limit: [offset, 100])).empty?
+          puts "offset=#{offset}"
+          counter = 0
+          jobs.each do |job|
+            if conn.zrem(sorted_set, job)
+              Sidekiq::Client.push(Sidekiq.load_json(job))
+            else
+              counter += 1
+            end
+          end
+          if counter > 50
+            offset = (200..10000).to_a.sample
           end
         end
       end
